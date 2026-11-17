@@ -13,9 +13,12 @@ Scenarios:
   5. after two concurrent slow queries, later requests still get their own
      results (connection reuse after confirmed rollback)
   6. pool capacity really is two (observed via pg_stat_activity)
+  7. mixed urgent/normal queue: urgent overtakes, two-in-a-row cap, FIFO
+  8. queued expiry/revocation never occupies a slot; follow-up queries work
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import sys
@@ -331,6 +334,225 @@ def case_discard_and_rebuild() -> None:
           observed and max(observed) <= 2, f"max={max(observed)}")
 
 
+def case_priority_default_and_field() -> None:
+    # Default urgency is ordinary and the receipt echoes the actual level.
+    status, body = post(
+        "/query", {"sql": "SELECT 1", "timeout_ms": 5000}
+    )
+    check("缺省 priority=normal 且回执回显",
+          status == 200 and body.get("priority") == "normal", body)
+
+    status, body = post(
+        "/query",
+        {"sql": "SELECT 2", "timeout_ms": 5000, "priority": "urgent"},
+    )
+    check("显式 urgent 回执回显",
+          status == 200 and body.get("priority") == "urgent", body)
+
+    status, body = post(
+        "/query",
+        {"sql": "SELECT 3", "timeout_ms": 5000, "priority": "critical"},
+    )
+    check("非法 priority 被 422 拒绝", status == 422, body)
+
+
+def case_mixed_priority_queue() -> None:
+    """Urgent overtakes ordinary; burst cap 2; FIFO inside one class."""
+    finished: list[tuple] = []
+    lock = threading.Lock()
+
+    def slow(marker: str, sleep_s: float, priority: str) -> None:
+        t0 = time.monotonic()
+        status, body = post(
+            "/query",
+            {
+                "sql": f"SELECT '{marker}', clock_timestamp(), "
+                       f"pg_sleep({sleep_s})",
+                "timeout_ms": 15000,
+                "priority": priority,
+            },
+            timeout=30,
+        )
+        with lock:
+            finished.append(
+                (
+                    marker,
+                    status,
+                    body,
+                    round((time.monotonic() - t0), 3),
+                )
+            )
+
+    # Two ordinary slow queries occupy both connections (~2.5s).
+    holders = [
+        threading.Thread(target=slow, args=("H1", 2.5, "normal")),
+        threading.Thread(target=slow, args=("H2", 2.5, "normal")),
+    ]
+    for t in holders:
+        t.start()
+    time.sleep(0.4)
+
+    # Now queue, in strict order: N1, N2, U1, U2, U3, U4, N3.
+    queued: list[threading.Thread] = []
+    for marker, prio in [
+        ("N1", "normal"), ("N2", "normal"),
+        ("U1", "urgent"), ("U2", "urgent"), ("U3", "urgent"), ("U4", "urgent"),
+        ("N3", "normal"),
+    ]:
+        t = threading.Thread(target=slow, args=(marker, 0.05, prio))
+        queued.append(t)
+        t.start()
+        time.sleep(0.05)
+
+    time.sleep(0.3)
+    status, health = get("/health")
+    check("健康检查可见普通/紧急排队计数",
+          status == 200 and health["pool"]["waiting_normal"] == 3
+          and health["pool"]["waiting_urgent"] == 4, health)
+
+    for t in holders + queued:
+        t.join()
+
+    by_marker = {m: (s, b, el) for m, s, b, el in finished}
+    check("9 个请求全部成功",
+          len(finished) == 9 and all(s == 200 for _, s, _, _ in finished),
+          finished)
+    check(
+        "每个请求拿到自身标记结果（无串结果）",
+        {b["rows"][0][0] for _, _, b, _ in finished}
+        == {"H1", "H2", "N1", "N2", "N3", "U1", "U2", "U3", "U4"},
+        finished,
+    )
+
+    def started_at(marker: str) -> str:
+        # clock_timestamp() text is lexicographically orderable (timestamptz).
+        return by_marker[marker][1]["rows"][0][1]
+
+    check("U1 越过先入队的 N1/N2 先执行",
+          started_at("U1") < started_at("N1"), finished)
+    check("连续两条紧急后强制放行普通 N1",
+          started_at("N1") < started_at("U3"), finished)
+    check("第二轮两条紧急后强制放行普通 N2",
+          started_at("N2") < started_at("N3")
+          and started_at("U4") < started_at("N2"),
+          finished)
+    check("同等级内保持 FIFO（U1 先于 U2，N1 先于 N2）",
+          started_at("U1") < started_at("U2")
+          and started_at("N1") < started_at("N2"),
+          finished)
+    check("占用连接的 H1/H2 始终未被中断（均成功）",
+          by_marker["H1"][0] == 200 and by_marker["H2"][0] == 200, finished)
+
+    status, health = get("/health")
+    check("队列清空、两条连接全部空闲",
+          health["pool"]["idle"] == 2
+          and health["pool"]["waiting_normal"] == 0
+          and health["pool"]["waiting_urgent"] == 0, health)
+
+
+def case_queued_expiry_and_revoke() -> None:
+    """Expiry while queued never runs; a revoked queued request frees its slot."""
+    # ---- Part 1: short-budget request expires behind two busy backends ----
+    results: list[tuple] = []
+
+    def slow(marker: str, sleep_s: float, budget_ms: int) -> None:
+        status, body = post(
+            "/query",
+            {"sql": f"SELECT '{marker}', pg_sleep({sleep_s})",
+             "timeout_ms": budget_ms},
+            timeout=20,
+        )
+        results.append((marker, status, body))
+
+    t1 = threading.Thread(target=slow, args=("A", 2.0, 8000))
+    t2 = threading.Thread(target=slow, args=("B", 2.0, 8000))
+    t1.start()
+    time.sleep(0.25)
+    t2.start()
+    time.sleep(0.25)
+
+    t0 = time.monotonic()
+    status, body = post(
+        "/query",
+        {"sql": "SELECT 'EXPIRED-NEVER-RUNS'", "timeout_ms": 400},
+        timeout=10,
+    )
+    waited = time.monotonic() - t0
+    check("排队过期返回 503 且语句未执行",
+          status == 503
+          and body.get("error", {}).get("code") == "acquire_timeout", body)
+    check("排队等待计入预算 (~0.4s)", 0.35 < waited < 1.5, f"waited={waited:.2f}")
+
+    # An urgent request queued afterwards must still get its own result once
+    # a slot frees; the expired request must not have consumed any slot.
+    status, body = post(
+        "/query",
+        {"sql": "SELECT 'AFTER-EXPIRY-URGENT'",
+         "timeout_ms": 12000, "priority": "urgent"},
+        timeout=20,
+    )
+    check("过期请求不占名额，后续紧急请求获得自身结果",
+          status == 200 and body["rows"][0][0] == "AFTER-EXPIRY-URGENT", body)
+
+    t1.join()
+    t2.join()
+    check("占池查询各自成功",
+          {m for m, s, b in results if s == 200} == {"A", "B"}, results)
+
+    # ---- Part 2: client disconnects while still queued ----
+    holders = [
+        threading.Thread(target=slow, args=("C1", 2.0, 8000)),
+        threading.Thread(target=slow, args=("C2", 2.0, 8000)),
+    ]
+    for t in holders:
+        t.start()
+    time.sleep(0.5)
+
+    def disconnect_while_queued() -> tuple:
+        conn = http.client.HTTPConnection("127.0.0.1", 8000, timeout=10)
+        # Marker text deliberately avoids SQL keywords blocked by the
+        # read-only validator (e.g. REVOKE) so the request really enqueues.
+        payload = json.dumps(
+            {"sql": "SELECT 'GONE-WHILE-WAITING'", "timeout_ms": 10000}
+        )
+        conn.request(
+            "POST", "/query", body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        time.sleep(0.4)  # ensure the request is queued behind both backends
+        conn.close()    # revoke while waiting; running SQL is untouched
+        return ("revoked",)
+
+    dt = threading.Thread(target=disconnect_while_queued)
+    dt.start()
+    dt.join()
+
+    # Give the disconnect watcher a moment, then verify no slot was stolen.
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        _, health = get("/health")
+        if health["pool"]["waiting_normal"] == 0:
+            break
+        time.sleep(0.1)
+    check("断开后排队计数归零（请求已离开队列）",
+          health["pool"]["waiting_normal"] == 0
+          and health["pool"]["in_use"] == 2, health)
+
+    status, body = post(
+        "/query",
+        {"sql": "SELECT 'AFTER-GONE'", "timeout_ms": 12000},
+        timeout=20,
+    )
+    check("撤销不占名额，接续查询获得自身结果",
+          status == 200 and body["rows"][0][0] == "AFTER-GONE", body)
+
+    for t in holders:
+        t.join()
+    status, health = get("/health")
+    check("结束后两条连接全部空闲、容量为 2",
+          health["pool"]["size"] == 2 and health["pool"]["idle"] == 2, health)
+
+
 def main() -> int:
     print(f"self-test against {BASE}")
     run_case("1. 健康检查与普通查询", case_health_and_basic)
@@ -339,6 +561,9 @@ def main() -> int:
     run_case("4. 排队期间过期不执行", case_queued_expiry)
     run_case("5. 容量为 2 与接续查询", case_capacity_and_reuse)
     run_case("6. 弃置并补建 / 物理容量", case_discard_and_rebuild)
+    run_case("7. 紧急等级字段与混合队列调度", case_priority_default_and_field)
+    run_case("8. 排队到期/撤销不占名额与接续查询",
+             case_queued_expiry_and_revoke)
     print(f"\n结果: {PASS} 通过, {FAIL} 失败")
     return 1 if FAIL else 0
 

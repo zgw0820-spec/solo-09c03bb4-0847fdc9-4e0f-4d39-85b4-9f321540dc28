@@ -28,7 +28,7 @@ import psycopg
 
 from .config import Settings
 from .errors import QueryTimeout
-from .pool import QueryConnectionPool
+from .pool import Priority, QueryConnectionPool
 
 logger = logging.getLogger("executor")
 
@@ -38,7 +38,13 @@ class QueryExecutor:
         self._pool = pool
         self._settings = settings
 
-    async def execute(self, sql: str, deadline: float) -> dict[str, Any]:
+    async def execute(
+        self,
+        sql: str,
+        deadline: float,
+        priority: Priority = Priority.NORMAL,
+        cancel_event: asyncio.Event | None = None,
+    ) -> dict[str, Any]:
         """Execute one validated read-only statement against the pool.
 
         A dead-on-arrival backend (e.g. terminated out-of-band while idle)
@@ -48,9 +54,12 @@ class QueryExecutor:
         last_conn_error: psycopg.Error | None = None
         for attempt in (1, 2):
             wait_started = time.monotonic()
-            # Propagate PoolAcquireTimeout as a 503 receipt.  When this
-            # raises, no connection was borrowed and no statement was sent.
-            conn = await self._pool.acquire(deadline)
+            # Propagate PoolAcquireTimeout/PoolAcquireCancelled as receipts.
+            # When either raises, no connection was borrowed and no statement
+            # was sent.
+            conn = await self._pool.acquire(
+                deadline, priority=priority, cancel_event=cancel_event
+            )
             waited_ms = round((time.monotonic() - wait_started) * 1000, 3)
             acquired_at = time.monotonic()
 
@@ -86,14 +95,14 @@ class QueryExecutor:
                 )
             except (asyncio.TimeoutError, TimeoutError):
                 raise await self._handle_timeout(
-                    conn, task, waited_ms, acquired_at
+                    conn, task, waited_ms, acquired_at, priority
                 )
             except psycopg.errors.QueryCanceled as exc:
                 # The server-side statement_timeout backstop fired first.
                 # Same recovery protocol, same 504 receipt.
                 logger.warning("statement_timeout backstop fired: %s", exc)
                 raise await self._handle_timeout(
-                    conn, task, waited_ms, acquired_at, backstop=True
+                    conn, task, waited_ms, acquired_at, priority, backstop=True
                 )
             except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
                 # Connection-level failure (backend terminated/restarted):
@@ -116,6 +125,7 @@ class QueryExecutor:
             return {
                 "status": "ok",
                 "executed": True,
+                "priority": priority.value,
                 "wait_ms": waited_ms,
                 "execution_ms": elapsed_ms,
                 "row_count": len(rows),
@@ -132,6 +142,7 @@ class QueryExecutor:
         task: asyncio.Task,
         waited_ms: float,
         acquired_at: float,
+        priority: Priority,
         backstop: bool = False,
     ) -> QueryTimeout:
         logger.warning(
@@ -183,6 +194,7 @@ class QueryExecutor:
             extra={
                 "status": "timeout",
                 "executed": True,
+                "priority": priority.value,
                 "cancelled": cancel_ok,
                 "connection_discarded": discarded,
                 "wait_ms": waited_ms,

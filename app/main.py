@@ -8,6 +8,8 @@ Swagger UI is served at ``/docs``, ReDoc at ``/redoc``.
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -18,7 +20,7 @@ from fastapi.responses import JSONResponse
 from .config import settings
 from .errors import InvalidDeadlineError, QueryServiceError
 from .executor import QueryExecutor
-from .pool import QueryConnectionPool
+from .pool import Priority, QueryConnectionPool
 from .schemas import HealthResponse, QueryRequest, QueryResponse
 from .validation import validate_single_select
 
@@ -47,9 +49,14 @@ app = FastAPI(
     description=(
         "值班分析员共用的只读 SQL 查询入口。固定两条 PostgreSQL 连接，"
         "提交单条 SELECT 与总截止时间；排队时间计入预算，超时立即取消语句，"
-        "确认事务结束才复用连接，无法确认则弃置并补建。"
+        "确认事务结束才复用连接，无法确认则弃置并补建。\n\n"
+        "支持可选紧急等级（priority，默认 normal）：两条连接都忙时，urgent "
+        "请求可在等待队列中越过先入队的普通请求，但只调整等待顺序，不中断"
+        "正在执行的 SQL；只要有普通请求在等，连续放行最多两条紧急请求后必须"
+        "放行一条普通请求。等待期间到期或被撤销（如客户端断开）的请求不占用"
+        "名额、不发送 SQL，后续请求仍得到自身结果。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -81,7 +88,7 @@ async def _unexpected_handler(_: Request, exc: Exception):
 
 @app.get("/health", response_model=HealthResponse, tags=["运维"])
 async def health() -> HealthResponse:
-    """连接池健康状态：容量、空闲/占用数、累计创建与弃置数。"""
+    """连接池健康状态：容量、空闲/占用数、排队数、累计创建与弃置数。"""
     status = await pool.status()
     return HealthResponse(
         status="healthy",
@@ -92,6 +99,9 @@ async def health() -> HealthResponse:
             "total_created": status.total_created,
             "total_discarded": status.total_discarded,
             "closed": status.closed,
+            "waiting_normal": status.waiting_normal,
+            "waiting_urgent": status.waiting_urgent,
+            "urgent_grants_in_a_row": status.urgent_grants_in_a_row,
         },
     )
 
@@ -103,20 +113,47 @@ async def health() -> HealthResponse:
     responses={
         400: {"description": "SQL 不符合单条只读 SELECT 约束"},
         422: {"description": "请求体或截止时间不合法"},
+        499: {"description": "排队期间请求被撤销（如客户端断开），语句未执行"},
         503: {"description": "排队超时 / 连接被弃置"},
         504: {"description": "语句执行超过总截止时间"},
     },
 )
-async def query(body: QueryRequest) -> QueryResponse:
-    """执行一条只读 SELECT，``timeout_ms`` 是包含排队时间的总预算。"""
+async def query(request: Request, body: QueryRequest) -> QueryResponse:
+    """执行一条只读 SELECT，``timeout_ms`` 是包含排队时间的总预算。
+
+    ``priority`` 可选：``normal``（默认）或 ``urgent``。紧急请求只在
+    等待队列中越过普通请求，正在执行的语句不会被中断。
+    """
     if body.timeout_ms <= 0:
         raise InvalidDeadlineError("timeout_ms 必须为正整数")
 
     sql = validate_single_select(body.sql, settings.max_sql_chars)
+    priority = Priority(body.priority)
 
     # Absolute monotonic deadline: waiting + execution share one budget.
     deadline = time.monotonic() + body.timeout_ms / 1000.0
-    # A deadline that expires while queued surfaces as a 503
-    # acquire_timeout; an execution deadline as a 504 query_timeout.
-    result = await executor.execute(sql, deadline)
+
+    # A client that goes away while queued revokes the request: it must leave
+    # the queue without taking a slot or sending SQL.  Once a slot is granted
+    # the statement keeps running normally (running SQL is never interrupted).
+    client_gone = asyncio.Event()
+
+    async def _watch_disconnect() -> None:
+        while not client_gone.is_set():
+            if await request.is_disconnected():
+                client_gone.set()
+                return
+            await asyncio.sleep(0.1)
+
+    watcher = asyncio.ensure_future(_watch_disconnect())
+    try:
+        # A deadline that expires while queued surfaces as a 503
+        # acquire_timeout; an execution deadline as a 504 query_timeout.
+        result = await executor.execute(
+            sql, deadline, priority=priority, cancel_event=client_gone
+        )
+    finally:
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await watcher
     return QueryResponse(**result)

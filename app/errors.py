@@ -30,6 +30,19 @@ class PoolAcquireTimeout(QueryServiceError):
     http_status = 503
 
 
+class PoolAcquireCancelled(QueryServiceError):
+    """Raised when a still-queued request is revoked (e.g. client gone).
+
+    Only requests that have not yet started executing can be cancelled;
+    running SQL is never interrupted.
+    """
+
+    code = "acquire_cancelled"
+    # 499 mirrors the conventional "client closed request" status and keeps
+    # the receipt distinct from 503 (deadline) and 504 (execution timeout).
+    http_status = 499
+
+
 class QueryTimeout(QueryServiceError):
     """Raised when the statement did not finish before the total deadline."""
 
